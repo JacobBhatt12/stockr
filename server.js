@@ -7,23 +7,12 @@ app.use(cors());
 app.use(express.json());
 
 const FINNHUB_KEY   = process.env.FINNHUB_KEY;
-const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
 const BASE = "https://finnhub.io/api/v1";
 
 async function finnhub(path) {
   const res = await fetch(`${BASE}${path}&token=${FINNHUB_KEY}`);
   if (!res.ok) throw new Error(`Finnhub ${res.status}`);
   return res.json();
-}
-
-async function claudeAI(system, message, maxTokens = 400) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type":"application/json", "x-api-key":ANTHROPIC_KEY, "anthropic-version":"2023-06-01" },
-    body: JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:maxTokens, system, messages:[{ role:"user", content:message }] }),
-  });
-  const d = await res.json();
-  return d.content?.[0]?.text || "";
 }
 
 // ── Search any stock in the world ───────────────────────────────────────────
@@ -55,7 +44,7 @@ app.get("/api/quote/:symbol", async (req, res) => {
       logo:      profile.logo || "",
       exchange:  profile.exchange || "",
       currency:  profile.currency || "USD",
-      price:     quote.c  || 0,
+      price:     quote.c  || quote.pc || 0,
       change:    quote.dp || 0,
       high:      quote.h  || 0,
       low:       quote.l  || 0,
@@ -74,7 +63,7 @@ app.post("/api/quotes", async (req, res) => {
       tickers.map(async ticker => {
         try {
           const q = await finnhub(`/quote?symbol=${ticker}`);
-          return { ticker, price:q.c||0, change:q.dp||0, high:q.h, low:q.l, prevClose:q.pc };
+          return { ticker, price:q.c||q.pc||0, change:q.dp||0, high:q.h, low:q.l, prevClose:q.pc };
         } catch { return { ticker, price:0, change:0 }; }
       })
     );
@@ -94,17 +83,31 @@ app.get("/api/news/:symbol", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── 30-day price history for charts ─────────────────────────────────────────
+// ── Price history for charts (supports 1W/1M/3M/6M/1Y) ──────────────────────
 app.get("/api/candles/:symbol", async (req, res) => {
   try {
     const { symbol } = req.params;
-    const to   = Math.floor(Date.now()/1000);
-    const from = to - 30*24*60*60;
-    const data = await finnhub(`/stock/candle?symbol=${symbol}&resolution=D&from=${from}&to=${to}`);
-    if (data.s !== "ok") return res.json([]);
+    const { timeframe = "1M" } = req.query;
+    const to = Math.floor(Date.now()/1000);
+    let from, resolution;
+    switch (timeframe) {
+      case "1W": from = to - 7*24*60*60;   resolution = "60"; break;
+      case "3M": from = to - 90*24*60*60;  resolution = "D";  break;
+      case "6M": from = to - 180*24*60*60; resolution = "D";  break;
+      case "1Y": from = to - 365*24*60*60; resolution = "D";  break;
+      default:   from = to - 30*24*60*60;  resolution = "D";  // 1M
+    }
+    const data = await finnhub(`/stock/candle?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${to}`);
+    if (data.s !== "ok" || !data.t?.length) return res.json([]);
     res.json(data.t.map((t,i) => ({
-      time:  new Date(t*1000).toLocaleDateString("en-US",{month:"short",day:"numeric"}),
-      close: data.c[i],
+      time:   resolution === "60"
+        ? new Date(t*1000).toLocaleString("en-US",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit",hour12:false})
+        : new Date(t*1000).toLocaleDateString("en-US",{month:"short",day:"numeric"}),
+      open:   data.o[i],
+      high:   data.h[i],
+      low:    data.l[i],
+      close:  data.c[i],
+      volume: data.v[i],
     })));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -122,36 +125,6 @@ app.get("/api/sentiment", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── AI Chat ──────────────────────────────────────────────────────────────────
-app.post("/api/chat", async (req, res) => {
-  try {
-    const { question, stockContext } = req.body;
-    const system = `You are a friendly stock market assistant inside STOCKR, a paper trading app.
-Current market data: ${JSON.stringify(stockContext)}.
-Keep answers to 2-4 sentences. Always note this is for educational purposes, not real financial advice.`;
-    const answer = await claudeAI(system, question, 350);
-    res.json({ answer });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ── AI Smart Alerts ───────────────────────────────────────────────────────────
-app.post("/api/ai-alerts", async (req, res) => {
-  try {
-    const { portfolio, stocks, sentiment } = req.body;
-    const system = `You are an AI financial analyst for a paper trading app called STOCKR.
-Analyze the user's portfolio and market conditions. Generate 2-4 short, specific, actionable alerts.
-Return ONLY a valid JSON array with this exact shape, nothing else:
-[{"type":"warning|opportunity|info","title":"Short title max 5 words","message":"One clear sentence.","ticker":"SYMBOL or null"}]`;
-    const raw    = await claudeAI(system,
-      `Portfolio: ${JSON.stringify(portfolio)}\nStocks: ${JSON.stringify(stocks)}\nSentiment: ${JSON.stringify(sentiment)}`,
-      500
-    );
-    const alerts = JSON.parse(raw.replace(/```json|```/g,"").trim());
-    res.json({ alerts });
-  } catch {
-    res.json({ alerts:[{ type:"info", title:"Market Open", message:"AI alerts are ready — add stocks to your watchlist to get personalized insights!", ticker:null }] });
-  }
-});
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`✅ STOCKR 2.0 running on http://localhost:${PORT}`));
